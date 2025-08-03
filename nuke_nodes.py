@@ -160,8 +160,8 @@ def main():
                     reason = "Stat reporting disabled. Disconnecting and blocking node."
                     update_blocked_node(node_id, reason)
                     disconnect_node(node_id, args.initial_node_id, reason)
-                    log_message("Blocked and disconnected node {}. Stopping further processing.".format(node_id))
-                    return  # Stop further processing after blocking one node
+                    log_message("Blocked and disconnected node {}. Continuing.".format(node_id))
+                    continue
 
                 # Check stats_enabled field
                 stats_enabled = node_data.get("stats_enabled", True)
@@ -184,7 +184,7 @@ def main():
                     update_blocked_node(node_id, reason)
                     disconnect_node(node_id, args.initial_node_id, reason)
                     log_message("Disconnected and blocked node {} due to crosslinking.".format(node_id))
-                    return  # Exit after handling a crosslink
+                    continue
 
                 if stats_enabled is True:
                     log_message("Node {} has stats explicitly enabled. It will remain connected.".format(node_id))
@@ -196,8 +196,8 @@ def main():
                     reason = "Stat reporting disabled or missing. Disconnecting and blocking node."
                     update_blocked_node(node_id, reason)
                     disconnect_node(node_id, args.initial_node_id, reason)
-                    log_message("Blocked and disconnected node {}. Stopping further processing.".format(node_id))
-                    return  # Stop further processing after blocking one node
+                    log_message("Blocked and disconnected node {}. Continuing.".format(node_id))
+                    continue
 
                 # Block and disconnect nodes explicitly reporting stats_enabled: False
                 if stats_enabled is False:
@@ -205,11 +205,14 @@ def main():
                     reason = "Stat reporting disabled. Disconnecting and blocking node."
                     update_blocked_node(node_id, reason)
                     disconnect_node(node_id, args.initial_node_id, reason)
-                    log_message("Blocked and disconnected node {}. Stopping further processing.".format(node_id))
-                    return  # Stop further processing after blocking one node
+                    log_message("Blocked and disconnected node {}. Continuing.".format(node_id))
+                    continue
 
         else:
-            log_message("No valid data retrieved for the initial node. Exiting.")
+            log_message("No valid data retrieved for the initial node. Retrying.")
+            if args.loop:
+                time.sleep(args.loop)
+                continue
             break
 
         if args.loop:
