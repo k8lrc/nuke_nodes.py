@@ -23,6 +23,14 @@ DB_FAMILY = "blacklist"  # Database family for blacklist
 
 STATS_URL = "https://stats.allstarlink.org/api/stats/"
 
+# Threshold and window for detecting nodes that repeatedly connect and
+# disconnect in a short period of time (flapping)
+FLAP_WINDOW = 60  # seconds
+FLAP_THRESHOLD = 4  # number of connect/disconnect events within window
+
+# Records of connection activity for flapping detection
+flap_records = {}
+
 def load_list(file_path):
     """Loads a list of node IDs from a text file."""
     try:
@@ -114,6 +122,30 @@ def detect_area_restrictions(node_id, area_restrictions):
     log_message("Node {} is not in a restricted area.".format(node_id))
     return False
 
+
+def track_flapping(node_id, initial_node_id, event):
+    """Track connect/disconnect events and block nodes that flap."""
+    now = time.time()
+    record = flap_records.get(node_id, {"count": 0, "last_time": now})
+    if now - record["last_time"] <= FLAP_WINDOW:
+        record["count"] += 1
+    else:
+        record["count"] = 1
+    record["last_time"] = now
+    flap_records[node_id] = record
+
+    log_message("Node {} {}. Flap count: {}".format(node_id, event, record["count"]))
+
+    if record["count"] >= FLAP_THRESHOLD:
+        reason = "Repeated connect/disconnect activity (flapping)."
+        update_blocked_node(node_id, reason)
+        if event == "connected":
+            disconnect_node(node_id, initial_node_id, reason)
+        log_message("Blocked node {} due to flapping.".format(node_id))
+        flap_records.pop(node_id, None)
+        return True
+    return False
+
 def main():
     parser = argparse.ArgumentParser(description='Fetch and process node data.')
     parser.add_argument('initial_node_id', type=str, help='Initial Node ID to fetch data for')
@@ -132,12 +164,32 @@ def main():
 
     initial_url = STATS_URL + args.initial_node_id
 
+    previous_links = set()
+
     while True:
         initial_data = fetch_data(initial_url)
 
         if initial_data:
             links = initial_data.get('stats', {}).get('data', {}).get('links', [])
             log_message("Initial node {} connected links: {}".format(args.initial_node_id, links))
+
+            current_links = {str(link) for link in links}
+            new_connections = current_links - previous_links
+            disconnections = previous_links - current_links
+
+            for node_id in new_connections:
+                if node_id in whitelist:
+                    continue
+                if track_flapping(node_id, args.initial_node_id, "connected"):
+                    return
+
+            for node_id in disconnections:
+                if node_id in whitelist:
+                    continue
+                if track_flapping(node_id, args.initial_node_id, "disconnected"):
+                    return
+
+            previous_links = current_links
 
             for node_id in links:
                 log_message("Processing node ID: {}".format(node_id))
