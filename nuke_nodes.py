@@ -23,6 +23,11 @@ DB_FAMILY = "blacklist"  # Database family for blacklist
 
 STATS_URL = "https://stats.allstarlink.org/api/stats/"
 
+# Maximum number of connection state changes before a node is banned for flapping
+FLAP_THRESHOLD = 6
+# Duration (in seconds) that a node remains banned
+BAN_DURATION = 7 * 24 * 60 * 60  # One week
+
 def load_list(file_path):
     """Loads a list of node IDs from a text file."""
     try:
@@ -32,16 +37,23 @@ def load_list(file_path):
         log_message("File not found: {}".format(file_path))
         return set()
 
-def update_blocked_node(node_id, comment=""):
-    """Update the Asterisk database to block the node."""
+def update_blocked_node(node_id, comment="", ban_duration=BAN_DURATION):
+    """Update the Asterisk database to block the node and schedule unblocking after `ban_duration` seconds (converted to days for scheduling)."""
     try:
         sanitized_comment = comment.replace(" ", "_")
         command = "{} {} -rx \"database put {} {} {}\"".format(SUDO, ASTERISK, DB_FAMILY, node_id, sanitized_comment)
         log_message("Running command: {}".format(command))
         subprocess.run(command, shell=True, check=True)
         log_message("Blocked node {} with comment: {}".format(node_id, sanitized_comment))
+
+        # Schedule unban after the specified duration using the `at` command
+        unban_cmd = "{} {} -rx 'database del {} {}'".format(SUDO, ASTERISK, DB_FAMILY, node_id)
+        ban_days = int(ban_duration / (24 * 60 * 60))
+        at_command = "echo \"{}\" | {} at now + {} days".format(unban_cmd, SUDO, ban_days)
+        log_message("Scheduling unban command: {}".format(at_command))
+        subprocess.run(at_command, shell=True, check=True)
     except subprocess.CalledProcessError as e:
-        log_message("Failed to block node {}: {}".format(node_id, e))
+        log_message("Failed to block or schedule unban for node {}: {}".format(node_id, e))
 
 def disconnect_node(node_id, initial_node_id, reason=""):
     """Disconnect a node using Asterisk rpt command."""
@@ -131,22 +143,44 @@ def main():
     whitelist = load_list(args.whitelist) if args.whitelist else set()
 
     initial_url = STATS_URL + args.initial_node_id
+    flap_counts = {}
+    prev_links = set()
 
     while True:
         initial_data = fetch_data(initial_url)
 
         if initial_data:
             links = initial_data.get('stats', {}).get('data', {}).get('links', [])
-            log_message("Initial node {} connected links: {}".format(args.initial_node_id, links))
+            current_links = {str(link) for link in links}
 
-            for node_id in links:
+            # Detect nodes repeatedly connecting and disconnecting (flapping)
+            changed_nodes = current_links.symmetric_difference(prev_links)
+            for node in changed_nodes:
+                if node in whitelist:
+                    continue
+                flap_counts[node] = flap_counts.get(node, 0) + 1
+                log_message("Node {} connection state changed {} times.".format(node, flap_counts[node]))
+                if flap_counts[node] >= FLAP_THRESHOLD:
+                    reason = "Excessive connect/disconnect events"
+                    update_blocked_node(node, reason)
+                    if node in current_links:
+                        disconnect_node(node, args.initial_node_id, reason)
+                    log_message("Blocked{} node {} due to excessive flapping.".format(
+                        " and disconnected" if node in current_links else "", node))
+                    flap_counts.pop(node, None)
+                    current_links.discard(node)
+
+            prev_links = current_links.copy()
+            log_message("Initial node {} connected links: {}".format(args.initial_node_id, list(current_links)))
+
+            for node_id in current_links:
                 log_message("Processing node ID: {}".format(node_id))
 
-                if str(node_id) in whitelist:
+                if node_id in whitelist:
                     log_message("Node {} is in the whitelist. It will remain connected.".format(node_id))
                     continue
 
-                node_url = "https://stats.allstarlink.org/api/stats/" + str(node_id)
+                node_url = "https://stats.allstarlink.org/api/stats/" + node_id
                 node_data = fetch_data(node_url)
 
                 if not node_data:
