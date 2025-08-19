@@ -151,12 +151,12 @@ def main():
 
         if initial_data:
             links = initial_data.get('stats', {}).get('data', {}).get('links', [])
-            current_links = set(links)
+            current_links = {str(link) for link in links}
 
             # Detect nodes repeatedly connecting and disconnecting (flapping)
             changed_nodes = current_links.symmetric_difference(prev_links)
             for node in changed_nodes:
-                if str(node) in whitelist:
+                if node in whitelist:
                     continue
                 flap_counts[node] = flap_counts.get(node, 0) + 1
                 log_message("Node {} connection state changed {} times.".format(node, flap_counts[node]))
@@ -176,11 +176,11 @@ def main():
             for node_id in current_links:
                 log_message("Processing node ID: {}".format(node_id))
 
-                if str(node_id) in whitelist:
+                if node_id in whitelist:
                     log_message("Node {} is in the whitelist. It will remain connected.".format(node_id))
                     continue
 
-                node_url = "https://stats.allstarlink.org/api/stats/" + str(node_id)
+                node_url = "https://stats.allstarlink.org/api/stats/" + node_id
                 node_data = fetch_data(node_url)
 
                 if not node_data:
