@@ -7,6 +7,7 @@ import time
 import sys
 import os
 import logging
+from collections import deque
 
 # Set up logging
 LOG_FILE = '/var/log/asterisk/nuke_nodes.log'
@@ -21,7 +22,30 @@ SUDO = "/usr/bin/sudo"  # Path to sudo
 ASTERISK = "/usr/sbin/asterisk"  # Path to Asterisk binary
 DB_FAMILY = "blacklist"  # Database family for blacklist
 
+# Threshold for repetitive banning allstar nodes when there is crosslinking and not reporting stats enabled
+THRESHOLD = 2  # Number of events within the monitoring period
+MONITOR_PERIOD = 60  # Monitoring period in seconds (e.g., 1 minute)
+
 STATS_URL = "https://stats.allstarlink.org/api/stats/"
+
+# Track repeated events for each node and action type within the monitoring period
+event_history = {}
+
+
+def _record_event(node_id, event_type):
+    """Track events for nodes and determine if the threshold is met."""
+    current_time = time.time()
+    key = (str(node_id), event_type)
+    history = event_history.setdefault(key, deque())
+    history.append(current_time)
+
+    while history and current_time - history[0] > MONITOR_PERIOD:
+        history.popleft()
+
+    if len(history) >= THRESHOLD:
+        history.clear()
+        return True
+    return False
 
 def load_list(file_path):
     """Loads a list of node IDs from a text file."""
@@ -156,12 +180,15 @@ def main():
                 # Check if stats field is None
                 stats = node_data.get("stats", None)
                 if stats is None:
-                    log_message("Node {} stats field is None. Treating as stats not enabled. Disconnecting and blocking.".format(node_id))
-                    reason = "Stat reporting disabled. Disconnecting and blocking node."
-                    update_blocked_node(node_id, reason)
-                    disconnect_node(node_id, args.initial_node_id, reason)
-                    log_message("Blocked and disconnected node {}. Stopping further processing.".format(node_id))
-                    return  # Stop further processing after blocking one node
+                    log_message("Node {} stats field is None. Treating as stats not enabled.".format(node_id))
+                    if _record_event(node_id, "stats_not_enabled"):
+                        reason = "Stat reporting disabled. Disconnecting and blocking node."
+                        update_blocked_node(node_id, reason)
+                        disconnect_node(node_id, args.initial_node_id, reason)
+                        log_message("Blocked and disconnected node {}. Stopping further processing.".format(node_id))
+                        return  # Stop further processing after blocking one node
+                    log_message("Threshold not met for node {} stats-disabled event. Continuing monitoring.".format(node_id))
+                    continue
 
                 # Check stats_enabled field
                 stats_enabled = node_data.get("stats_enabled", True)
@@ -180,11 +207,14 @@ def main():
 
                 if crosslink_detected:
                     log_message("Crosslink detected on node {} with unexpected nodes: {}".format(node_id, unexpected_nodes))
-                    reason = "Crosslinking detected with unexpected nodes: {}".format(unexpected_nodes)
-                    update_blocked_node(node_id, reason)
-                    disconnect_node(node_id, args.initial_node_id, reason)
-                    log_message("Disconnected and blocked node {} due to crosslinking.".format(node_id))
-                    return  # Exit after handling a crosslink
+                    if _record_event(node_id, "crosslinking"):
+                        reason = "Crosslinking detected with unexpected nodes: {}".format(unexpected_nodes)
+                        update_blocked_node(node_id, reason)
+                        disconnect_node(node_id, args.initial_node_id, reason)
+                        log_message("Disconnected and blocked node {} due to crosslinking.".format(node_id))
+                        return  # Exit after handling a crosslink
+                    log_message("Threshold not met for node {} crosslink event. Continuing monitoring.".format(node_id))
+                    continue
 
                 if stats_enabled is True:
                     log_message("Node {} has stats explicitly enabled. It will remain connected.".format(node_id))
@@ -192,21 +222,27 @@ def main():
 
                 # Treat stats_enabled=None as disabled if stats is missing
                 if stats_enabled is None:
-                    log_message("Node {} stats_enabled is None. Treating as stats not enabled. Disconnecting and blocking.".format(node_id))
-                    reason = "Stat reporting disabled or missing. Disconnecting and blocking node."
-                    update_blocked_node(node_id, reason)
-                    disconnect_node(node_id, args.initial_node_id, reason)
-                    log_message("Blocked and disconnected node {}. Stopping further processing.".format(node_id))
-                    return  # Stop further processing after blocking one node
+                    log_message("Node {} stats_enabled is None. Treating as stats not enabled.".format(node_id))
+                    if _record_event(node_id, "stats_not_enabled"):
+                        reason = "Stat reporting disabled or missing. Disconnecting and blocking node."
+                        update_blocked_node(node_id, reason)
+                        disconnect_node(node_id, args.initial_node_id, reason)
+                        log_message("Blocked and disconnected node {}. Stopping further processing.".format(node_id))
+                        return  # Stop further processing after blocking one node
+                    log_message("Threshold not met for node {} stats-disabled event. Continuing monitoring.".format(node_id))
+                    continue
 
                 # Block and disconnect nodes explicitly reporting stats_enabled: False
                 if stats_enabled is False:
-                    log_message("Node {} stats_enabled is explicitly False. Disconnecting and blocking.".format(node_id))
-                    reason = "Stat reporting disabled. Disconnecting and blocking node."
-                    update_blocked_node(node_id, reason)
-                    disconnect_node(node_id, args.initial_node_id, reason)
-                    log_message("Blocked and disconnected node {}. Stopping further processing.".format(node_id))
-                    return  # Stop further processing after blocking one node
+                    log_message("Node {} stats_enabled is explicitly False.".format(node_id))
+                    if _record_event(node_id, "stats_not_enabled"):
+                        reason = "Stat reporting disabled. Disconnecting and blocking node."
+                        update_blocked_node(node_id, reason)
+                        disconnect_node(node_id, args.initial_node_id, reason)
+                        log_message("Blocked and disconnected node {}. Stopping further processing.".format(node_id))
+                        return  # Stop further processing after blocking one node
+                    log_message("Threshold not met for node {} stats-disabled event. Continuing monitoring.".format(node_id))
+                    continue
 
         else:
             log_message("No valid data retrieved for the initial node. Exiting.")
