@@ -7,6 +7,7 @@ import time
 import sys
 import os
 import logging
+from collections import defaultdict
 
 # Set up logging
 LOG_FILE = '/var/log/asterisk/nuke_nodes.log'
@@ -22,6 +23,11 @@ ASTERISK = "/usr/sbin/asterisk"  # Path to Asterisk binary
 DB_FAMILY = "blacklist"  # Database family for blacklist
 
 STATS_URL = "https://stats.allstarlink.org/api/stats/"
+
+# Track reconnect activity across monitoring loops.
+RECONNECT_DECAY_SECONDS = int(os.environ.get("RECONNECT_DECAY_SECONDS", 3600))
+RECONNECT_ACTIVITY = defaultdict(lambda: {"count": 0, "last_seen": 0.0, "last_action": 0.0})
+CURRENT_CONNECTED_NODES = set()
 
 def load_list(file_path):
     """Loads a list of node IDs from a text file."""
@@ -132,12 +138,56 @@ def main():
 
     initial_url = STATS_URL + args.initial_node_id
 
+    global CURRENT_CONNECTED_NODES
+
     while True:
+        current_time = time.time()
         initial_data = fetch_data(initial_url)
 
         if initial_data:
             links = initial_data.get('stats', {}).get('data', {}).get('links', [])
             log_message("Initial node {} connected links: {}".format(args.initial_node_id, links))
+
+            current_connected_nodes = {str(node) for node in links}
+            new_connections = current_connected_nodes - CURRENT_CONNECTED_NODES
+
+            for node_str in new_connections:
+                record = RECONNECT_ACTIVITY[node_str]
+
+                if RECONNECT_DECAY_SECONDS and record["last_seen"]:
+                    elapsed = current_time - record["last_seen"]
+                    if elapsed > RECONNECT_DECAY_SECONDS:
+                        log_message(
+                            "Reconnect counter for node {} reset after {:.0f} seconds without activity.".format(
+                                node_str, elapsed
+                            )
+                        )
+                        record["count"] = 0
+
+                record["count"] += 1
+                record["last_seen"] = current_time
+                log_message(
+                    "Node {} transitioned to connected state. Reconnect count: {}.".format(
+                        node_str, record["count"]
+                    )
+                )
+
+                if node_str in whitelist:
+                    log_message("Node {} is whitelisted; reconnect counter will not trigger enforcement.".format(node_str))
+                    continue
+
+                if record["count"] == 2:
+                    record["last_action"] = current_time
+                    reason = "Repeated reconnection detected (second connection)."
+                    disconnect_node(node_str, args.initial_node_id, reason)
+                elif record["count"] >= 3:
+                    record["last_action"] = current_time
+                    reason = "Repeated reconnection detected (third connection)."
+                    update_blocked_node(node_str, reason)
+                    disconnect_node(node_str, args.initial_node_id, reason)
+                    record["count"] = 0
+
+            CURRENT_CONNECTED_NODES = current_connected_nodes
 
             for node_id in links:
                 log_message("Processing node ID: {}".format(node_id))
