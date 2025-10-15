@@ -15,6 +15,11 @@ logging.basicConfig(filename=LOG_FILE, level=logging.DEBUG, format='%(asctime)s 
 
 STATE_FILE = '/var/log/asterisk/nuke_nodes_state.json'
 
+# Connection attempt handling
+CONNECTION_DISCONNECT_THRESHOLD = 5
+CONNECTION_BAN_THRESHOLD = 6
+CONNECTION_ATTEMPT_RESET_SECONDS = 900  # Reset attempt counter after 15 minutes of inactivity
+
 def log_message(message):
     """Logs a message to the log file and console."""
     logging.debug(message)
@@ -71,13 +76,18 @@ def save_state(state):
         log_message("Failed to save state to {}: {}".format(STATE_FILE, error))
 
 
-def handle_connection_attempt(node_id, connection_state, initial_node_id):
+def handle_connection_attempt(node_id, connection_state, initial_node_id, timestamp):
     """Handle repeated connect/disconnect behavior for a node."""
     node_state = connection_state.setdefault(node_id, {
         'connection_attempts': 0,
         'is_connected': False,
         'banned': False,
+        'last_connected_at': None,
+        'last_disconnected_at': None,
+        'last_seen_at': None,
     })
+
+    node_state['last_seen_at'] = timestamp
 
     if node_state.get('banned'):
         log_message("Node {} is already banned due to excessive reconnects.".format(node_id))
@@ -86,36 +96,57 @@ def handle_connection_attempt(node_id, connection_state, initial_node_id):
     if node_state.get('is_connected'):
         return False
 
+    last_disconnected_at = node_state.get('last_disconnected_at')
+    if last_disconnected_at:
+        idle_seconds = timestamp - last_disconnected_at
+        if idle_seconds > CONNECTION_ATTEMPT_RESET_SECONDS and node_state.get('connection_attempts'):
+            log_message(
+                "Resetting connection attempt counter for node {} after {:.0f} seconds of inactivity.".format(
+                    node_id, idle_seconds
+                )
+            )
+            node_state['connection_attempts'] = 0
+
     node_state['connection_attempts'] = node_state.get('connection_attempts', 0) + 1
     node_state['is_connected'] = True
+    node_state['last_connected_at'] = timestamp
     attempts = node_state['connection_attempts']
     log_message("Node {} connection attempt count: {}".format(node_id, attempts))
 
-    if attempts >= 6:
+    if attempts >= CONNECTION_BAN_THRESHOLD:
         reason = "Excessive connect/disconnect cycles detected. Node banned."
         update_blocked_node(node_id, reason)
         disconnect_node(node_id, initial_node_id, reason)
         node_state['is_connected'] = False
         node_state['banned'] = True
+        node_state['last_disconnected_at'] = timestamp
         log_message("Node {} has been disconnected and banned after {} attempts.".format(node_id, attempts))
         return True
 
-    if attempts >= 5:
+    if attempts >= CONNECTION_DISCONNECT_THRESHOLD:
         reason = "Excessive connect/disconnect cycles detected. Node disconnected."
         disconnect_node(node_id, initial_node_id, reason)
         node_state['is_connected'] = False
+        node_state['last_disconnected_at'] = timestamp
         log_message("Node {} disconnected after {} attempts.".format(node_id, attempts))
         return True
 
     return False
 
 
-def update_disconnection_status(current_links, connection_state):
+def update_disconnection_status(current_links, connection_state, timestamp=None):
     """Update the state for nodes that are no longer connected."""
     current_link_set = {str(node) for node in current_links}
+    observed_at = timestamp if timestamp is not None else time.time()
     for node_id, node_state in list(connection_state.items()):
-        if node_state.get('is_connected') and node_id not in current_link_set:
+        if node_id in current_link_set:
+            node_state['last_seen_at'] = observed_at
+            continue
+
+        if node_state.get('is_connected'):
             node_state['is_connected'] = False
+            node_state['last_disconnected_at'] = observed_at
+            node_state['last_seen_at'] = observed_at
             log_message("Node {} disconnected. Total connection attempts recorded: {}".format(
                 node_id, node_state.get('connection_attempts', 0)
             ))
@@ -228,7 +259,10 @@ def main():
 
         if initial_data:
             links = initial_data.get('stats', {}).get('data', {}).get('links', [])
+            observation_time = time.time()
             log_message("Initial node {} connected links: {}".format(args.initial_node_id, links))
+
+            update_disconnection_status(links, connection_state, observation_time)
 
             for node_id in links:
                 log_message("Processing node ID: {}".format(node_id))
@@ -238,7 +272,7 @@ def main():
                     log_message("Node {} is in the whitelist. It will remain connected.".format(node_id))
                     continue
 
-                if handle_connection_attempt(node_id_str, connection_state, args.initial_node_id):
+                if handle_connection_attempt(node_id_str, connection_state, args.initial_node_id, observation_time):
                     save_state(connection_state)
                     continue
 
@@ -317,7 +351,7 @@ def main():
             save_state(connection_state)
             break
 
-        update_disconnection_status(links, connection_state)
+        update_disconnection_status(links, connection_state, time.time())
         save_state(connection_state)
 
         if args.loop:
