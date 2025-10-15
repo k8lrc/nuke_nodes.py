@@ -7,10 +7,13 @@ import time
 import sys
 import os
 import logging
+import json
 
 # Set up logging
 LOG_FILE = '/var/log/asterisk/nuke_nodes.log'
 logging.basicConfig(filename=LOG_FILE, level=logging.DEBUG, format='%(asctime)s - %(message)s')
+
+STATE_FILE = '/var/log/asterisk/nuke_nodes_state.json'
 
 def log_message(message):
     """Logs a message to the log file and console."""
@@ -31,6 +34,92 @@ def load_list(file_path):
     except FileNotFoundError:
         log_message("File not found: {}".format(file_path))
         return set()
+
+
+def ensure_directory_exists(path):
+    """Ensure the directory for the provided path exists."""
+    directory = os.path.dirname(path)
+    if directory and not os.path.exists(directory):
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError as error:
+            log_message("Failed to create directory {}: {}".format(directory, error))
+
+
+def load_state():
+    """Load the persistent node connection state from disk."""
+    try:
+        with open(STATE_FILE, 'r') as state_file:
+            data = json.load(state_file)
+            return {str(key): value for key, value in data.items()}
+    except FileNotFoundError:
+        log_message("State file not found: {}. Starting with empty state.".format(STATE_FILE))
+    except json.JSONDecodeError as error:
+        log_message("Failed to decode state file {}: {}. Resetting state.".format(STATE_FILE, error))
+    except Exception as error:
+        log_message("Unexpected error reading state file {}: {}".format(STATE_FILE, error))
+    return {}
+
+
+def save_state(state):
+    """Persist the node connection state to disk."""
+    try:
+        ensure_directory_exists(STATE_FILE)
+        with open(STATE_FILE, 'w') as state_file:
+            json.dump(state, state_file)
+    except Exception as error:
+        log_message("Failed to save state to {}: {}".format(STATE_FILE, error))
+
+
+def handle_connection_attempt(node_id, connection_state, initial_node_id):
+    """Handle repeated connect/disconnect behavior for a node."""
+    node_state = connection_state.setdefault(node_id, {
+        'connection_attempts': 0,
+        'is_connected': False,
+        'banned': False,
+    })
+
+    if node_state.get('banned'):
+        log_message("Node {} is already banned due to excessive reconnects.".format(node_id))
+        return True
+
+    if node_state.get('is_connected'):
+        return False
+
+    node_state['connection_attempts'] = node_state.get('connection_attempts', 0) + 1
+    node_state['is_connected'] = True
+    attempts = node_state['connection_attempts']
+    log_message("Node {} connection attempt count: {}".format(node_id, attempts))
+
+    if attempts >= 6:
+        reason = "Excessive connect/disconnect cycles detected. Node banned."
+        update_blocked_node(node_id, reason)
+        disconnect_node(node_id, initial_node_id, reason)
+        node_state['is_connected'] = False
+        node_state['banned'] = True
+        log_message("Node {} has been disconnected and banned after {} attempts.".format(node_id, attempts))
+        return True
+
+    if attempts >= 5:
+        reason = "Excessive connect/disconnect cycles detected. Node disconnected."
+        disconnect_node(node_id, initial_node_id, reason)
+        node_state['is_connected'] = False
+        log_message("Node {} disconnected after {} attempts.".format(node_id, attempts))
+        return True
+
+    return False
+
+
+def update_disconnection_status(current_links, connection_state):
+    """Update the state for nodes that are no longer connected."""
+    current_link_set = {str(node) for node in current_links}
+    for node_id, node_state in list(connection_state.items()):
+        if node_state.get('is_connected') and node_id not in current_link_set:
+            node_state['is_connected'] = False
+            log_message("Node {} disconnected. Total connection attempts recorded: {}".format(
+                node_id, node_state.get('connection_attempts', 0)
+            ))
+
 
 def update_blocked_node(node_id, comment=""):
     """Update the Asterisk database to block the node."""
@@ -132,6 +221,8 @@ def main():
 
     initial_url = STATS_URL + args.initial_node_id
 
+    connection_state = load_state()
+
     while True:
         initial_data = fetch_data(initial_url)
 
@@ -141,9 +232,14 @@ def main():
 
             for node_id in links:
                 log_message("Processing node ID: {}".format(node_id))
+                node_id_str = str(node_id)
 
-                if str(node_id) in whitelist:
+                if node_id_str in whitelist:
                     log_message("Node {} is in the whitelist. It will remain connected.".format(node_id))
+                    continue
+
+                if handle_connection_attempt(node_id_str, connection_state, args.initial_node_id):
+                    save_state(connection_state)
                     continue
 
                 node_url = "https://stats.allstarlink.org/api/stats/" + str(node_id)
@@ -160,7 +256,9 @@ def main():
                     reason = "Stat reporting disabled. Disconnecting and blocking node."
                     update_blocked_node(node_id, reason)
                     disconnect_node(node_id, args.initial_node_id, reason)
+                    connection_state.pop(node_id_str, None)
                     log_message("Blocked and disconnected node {}. Stopping further processing.".format(node_id))
+                    save_state(connection_state)
                     return  # Stop further processing after blocking one node
 
                 # Check stats_enabled field
@@ -183,7 +281,9 @@ def main():
                     reason = "Crosslinking detected with unexpected nodes: {}".format(unexpected_nodes)
                     update_blocked_node(node_id, reason)
                     disconnect_node(node_id, args.initial_node_id, reason)
+                    connection_state.pop(node_id_str, None)
                     log_message("Disconnected and blocked node {} due to crosslinking.".format(node_id))
+                    save_state(connection_state)
                     return  # Exit after handling a crosslink
 
                 if stats_enabled is True:
@@ -196,7 +296,9 @@ def main():
                     reason = "Stat reporting disabled or missing. Disconnecting and blocking node."
                     update_blocked_node(node_id, reason)
                     disconnect_node(node_id, args.initial_node_id, reason)
+                    connection_state.pop(node_id_str, None)
                     log_message("Blocked and disconnected node {}. Stopping further processing.".format(node_id))
+                    save_state(connection_state)
                     return  # Stop further processing after blocking one node
 
                 # Block and disconnect nodes explicitly reporting stats_enabled: False
@@ -205,12 +307,18 @@ def main():
                     reason = "Stat reporting disabled. Disconnecting and blocking node."
                     update_blocked_node(node_id, reason)
                     disconnect_node(node_id, args.initial_node_id, reason)
+                    connection_state.pop(node_id_str, None)
                     log_message("Blocked and disconnected node {}. Stopping further processing.".format(node_id))
+                    save_state(connection_state)
                     return  # Stop further processing after blocking one node
 
         else:
             log_message("No valid data retrieved for the initial node. Exiting.")
+            save_state(connection_state)
             break
+
+        update_disconnection_status(links, connection_state)
+        save_state(connection_state)
 
         if args.loop:
             time.sleep(args.loop)
