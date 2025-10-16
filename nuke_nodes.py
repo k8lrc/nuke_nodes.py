@@ -239,10 +239,13 @@ def is_stats_enabled(node_id):
     log_message("Node {} is either not reporting stats or inactive.".format(node_id))
     return False
 
-def detect_crosslinking(node_id, links, whitelisted_nodes):
+def detect_crosslinking(node_id, links, whitelisted_nodes, initial_node_id):
     """Detect crosslinking for a given node based on its connections."""
-    log_message("Node {} checking links against whitelist: {}".format(node_id, whitelisted_nodes))
-    unexpected_nodes = [link for link in links if str(link) not in whitelisted_nodes]
+    allowed_nodes = {str(initial_node_id), str(node_id)} | {str(node) for node in whitelisted_nodes}
+    log_message(
+        "Node {} checking links against whitelist: {}".format(node_id, sorted(allowed_nodes))
+    )
+    unexpected_nodes = [link for link in links if str(link) not in allowed_nodes]
     log_message("Node {} connected links: {}".format(node_id, links))
     log_message("Node {} unexpected connections: {}".format(node_id, unexpected_nodes))
     if unexpected_nodes:
@@ -341,7 +344,9 @@ def main():
                     log_message("Node {} is only connected to initial node {} and is not providing crosslink. It will remain connected.".format(node_id, args.initial_node_id))
                     continue
 
-                crosslink_detected, unexpected_nodes = detect_crosslinking(node_id, current_links, whitelist)
+                crosslink_detected, unexpected_nodes = detect_crosslinking(
+                    node_id, current_links, whitelist, args.initial_node_id
+                )
 
                 if crosslink_detected:
                     log_message("Crosslink detected on node {} with unexpected nodes: {}".format(node_id, unexpected_nodes))
