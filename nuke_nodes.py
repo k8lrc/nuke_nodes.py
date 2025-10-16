@@ -15,6 +15,9 @@ logging.basicConfig(filename=LOG_FILE, level=logging.DEBUG, format='%(asctime)s 
 
 STATE_FILE = '/var/log/asterisk/nuke_nodes_state.json'
 
+# Nodes that should never be disconnected or blocked.
+WHITELISTED_NODES = set()
+
 # Connection attempt handling
 CONNECTION_DISCONNECT_THRESHOLD = 5
 CONNECTION_BAN_THRESHOLD = 6
@@ -66,6 +69,11 @@ def load_state():
     return {}
 
 
+def is_whitelisted(node_id):
+    """Return True when the node ID is in the global whitelist."""
+    return str(node_id) in WHITELISTED_NODES
+
+
 def save_state(state):
     """Persist the node connection state to disk."""
     try:
@@ -78,6 +86,11 @@ def save_state(state):
 
 def handle_connection_attempt(node_id, connection_state, initial_node_id, timestamp):
     """Handle repeated connect/disconnect behavior for a node."""
+    if is_whitelisted(node_id):
+        if connection_state.pop(node_id, None):
+            log_message("Node {} is whitelisted. Clearing connection tracking state.".format(node_id))
+        return False
+
     node_state = connection_state.setdefault(node_id, {
         'connection_attempts': 0,
         'is_connected': False,
@@ -139,6 +152,11 @@ def update_disconnection_status(current_links, connection_state, timestamp=None)
     current_link_set = {str(node) for node in current_links}
     observed_at = timestamp if timestamp is not None else time.time()
     for node_id, node_state in list(connection_state.items()):
+        if is_whitelisted(node_id):
+            if connection_state.pop(node_id, None) is not None:
+                log_message("Node {} is whitelisted. Removing it from connection tracking.".format(node_id))
+            continue
+
         if node_id in current_link_set:
             node_state['last_seen_at'] = observed_at
             continue
@@ -154,6 +172,9 @@ def update_disconnection_status(current_links, connection_state, timestamp=None)
 
 def update_blocked_node(node_id, comment=""):
     """Update the Asterisk database to block the node."""
+    if is_whitelisted(node_id):
+        log_message("Node {} is whitelisted. Skipping block request.".format(node_id))
+        return
     try:
         sanitized_comment = comment.replace(" ", "_")
         command = "{} {} -rx \"database put {} {} {}\"".format(SUDO, ASTERISK, DB_FAMILY, node_id, sanitized_comment)
@@ -165,6 +186,9 @@ def update_blocked_node(node_id, comment=""):
 
 def disconnect_node(node_id, initial_node_id, reason=""):
     """Disconnect a node using Asterisk rpt command."""
+    if is_whitelisted(node_id):
+        log_message("Node {} is whitelisted. Skipping disconnect request.".format(node_id))
+        return
     try:
         command = "{} {} -rx \"rpt fun {} *1{}\"".format(SUDO, ASTERISK, initial_node_id, node_id)
         log_message("Disconnecting node {} from {}. Reason: {}".format(node_id, initial_node_id, reason))
@@ -249,10 +273,19 @@ def main():
 
     area_restrictions = load_list(args.area_restrictions) if args.area_restrictions else set()
     whitelist = load_list(args.whitelist) if args.whitelist else set()
+    if whitelist:
+        log_message("Loaded whitelist: {}".format(sorted(whitelist)))
+
+    global WHITELISTED_NODES
+    WHITELISTED_NODES = {str(node_id) for node_id in whitelist}
 
     initial_url = STATS_URL + args.initial_node_id
 
     connection_state = load_state()
+    for node_id in list(connection_state.keys()):
+        if is_whitelisted(node_id):
+            connection_state.pop(node_id, None)
+            log_message("Node {} is whitelisted at startup. Removed from tracked state.".format(node_id))
 
     while True:
         initial_data = fetch_data(initial_url)
