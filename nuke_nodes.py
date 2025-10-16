@@ -18,6 +18,11 @@ STATE_FILE = '/var/log/asterisk/nuke_nodes_state.json'
 # Nodes that should never be disconnected or blocked.
 WHITELISTED_NODES = set()
 
+# Default locations checked when --whitelist is not provided explicitly.
+DEFAULT_WHITELIST_PATHS = [
+    "/root/whitelist.txt",
+]
+
 # Connection attempt handling
 CONNECTION_DISCONNECT_THRESHOLD = 5
 CONNECTION_BAN_THRESHOLD = 6
@@ -34,13 +39,14 @@ DB_FAMILY = "blacklist"  # Database family for blacklist
 
 STATS_URL = "https://stats.allstarlink.org/api/stats/"
 
-def load_list(file_path):
+def load_list(file_path, quiet_missing=False):
     """Loads a list of node IDs from a text file."""
     try:
         with open(file_path, 'r') as file:
-            return {line.strip() for line in file}
+            return {line.strip() for line in file if line.strip()}
     except FileNotFoundError:
-        log_message("File not found: {}".format(file_path))
+        if not quiet_missing:
+            log_message("File not found: {}".format(file_path))
         return set()
 
 
@@ -82,6 +88,33 @@ def save_state(state):
             json.dump(state, state_file)
     except Exception as error:
         log_message("Failed to save state to {}: {}".format(STATE_FILE, error))
+
+
+def load_whitelist(cli_whitelist_path):
+    """Load whitelist entries from the CLI path or default locations."""
+    candidate_paths = []
+    if cli_whitelist_path:
+        candidate_paths.append(cli_whitelist_path)
+    for default_path in DEFAULT_WHITELIST_PATHS:
+        if default_path not in candidate_paths:
+            candidate_paths.append(default_path)
+
+    for path in candidate_paths:
+        quiet_missing = path in DEFAULT_WHITELIST_PATHS and path != cli_whitelist_path
+        entries = load_list(path, quiet_missing=quiet_missing)
+        if os.path.exists(path):
+            log_message("Loaded whitelist from {}: {}".format(path, sorted(entries)))
+            return entries
+        if entries:
+            # File may exist temporarily or be virtual; still honour entries.
+            log_message("Loaded whitelist entries: {}".format(sorted(entries)))
+            return entries
+
+    if cli_whitelist_path:
+        log_message("Whitelist file {} not found. Proceeding without whitelist.".format(cli_whitelist_path))
+    else:
+        log_message("No whitelist file found in default locations. Proceeding without whitelist.")
+    return set()
 
 
 def handle_connection_attempt(node_id, connection_state, initial_node_id, timestamp):
@@ -275,12 +308,10 @@ def main():
         sys.exit(1)
 
     area_restrictions = load_list(args.area_restrictions) if args.area_restrictions else set()
-    whitelist = load_list(args.whitelist) if args.whitelist else set()
-    if whitelist:
-        log_message("Loaded whitelist: {}".format(sorted(whitelist)))
+    whitelist_entries = load_whitelist(args.whitelist)
 
     global WHITELISTED_NODES
-    WHITELISTED_NODES = {str(node_id) for node_id in whitelist}
+    WHITELISTED_NODES = {str(node_id) for node_id in whitelist_entries}
 
     initial_url = STATS_URL + args.initial_node_id
 
@@ -304,7 +335,7 @@ def main():
                 log_message("Processing node ID: {}".format(node_id))
                 node_id_str = str(node_id)
 
-                if node_id_str in whitelist:
+                if is_whitelisted(node_id_str):
                     log_message("Node {} is in the whitelist. It will remain connected.".format(node_id))
                     continue
 
@@ -345,7 +376,7 @@ def main():
                     continue
 
                 crosslink_detected, unexpected_nodes = detect_crosslinking(
-                    node_id, current_links, whitelist, args.initial_node_id
+                    node_id, current_links, WHITELISTED_NODES, args.initial_node_id
                 )
 
                 if crosslink_detected:
