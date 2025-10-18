@@ -7,10 +7,26 @@ import time
 import sys
 import os
 import logging
+import json
 
 # Set up logging
 LOG_FILE = '/var/log/asterisk/nuke_nodes.log'
 logging.basicConfig(filename=LOG_FILE, level=logging.DEBUG, format='%(asctime)s - %(message)s')
+
+STATE_FILE = '/var/log/asterisk/nuke_nodes_state.json'
+
+# Nodes that should never be disconnected or blocked.
+WHITELISTED_NODES = set()
+
+# Default locations checked when --whitelist is not provided explicitly.
+DEFAULT_WHITELIST_PATHS = [
+    "/root/whitelist.txt",
+]
+
+# Connection attempt handling
+CONNECTION_DISCONNECT_THRESHOLD = 5
+CONNECTION_BAN_THRESHOLD = 6
+CONNECTION_ATTEMPT_RESET_SECONDS = 900  # Reset attempt counter after 15 minutes of inactivity
 
 def log_message(message):
     """Logs a message to the log file and console."""
@@ -23,17 +39,175 @@ DB_FAMILY = "blacklist"  # Database family for blacklist
 
 STATS_URL = "https://stats.allstarlink.org/api/stats/"
 
-def load_list(file_path):
+def load_list(file_path, quiet_missing=False):
     """Loads a list of node IDs from a text file."""
     try:
         with open(file_path, 'r') as file:
-            return {line.strip() for line in file}
+            return {line.strip() for line in file if line.strip()}
     except FileNotFoundError:
-        log_message("File not found: {}".format(file_path))
+        if not quiet_missing:
+            log_message("File not found: {}".format(file_path))
         return set()
+
+
+def ensure_directory_exists(path):
+    """Ensure the directory for the provided path exists."""
+    directory = os.path.dirname(path)
+    if directory and not os.path.exists(directory):
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError as error:
+            log_message("Failed to create directory {}: {}".format(directory, error))
+
+
+def load_state():
+    """Load the persistent node connection state from disk."""
+    try:
+        with open(STATE_FILE, 'r') as state_file:
+            data = json.load(state_file)
+            return {str(key): value for key, value in data.items()}
+    except FileNotFoundError:
+        log_message("State file not found: {}. Starting with empty state.".format(STATE_FILE))
+    except json.JSONDecodeError as error:
+        log_message("Failed to decode state file {}: {}. Resetting state.".format(STATE_FILE, error))
+    except Exception as error:
+        log_message("Unexpected error reading state file {}: {}".format(STATE_FILE, error))
+    return {}
+
+
+def is_whitelisted(node_id):
+    """Return True when the node ID is in the global whitelist."""
+    return str(node_id) in WHITELISTED_NODES
+
+
+def save_state(state):
+    """Persist the node connection state to disk."""
+    try:
+        ensure_directory_exists(STATE_FILE)
+        with open(STATE_FILE, 'w') as state_file:
+            json.dump(state, state_file)
+    except Exception as error:
+        log_message("Failed to save state to {}: {}".format(STATE_FILE, error))
+
+
+def load_whitelist(cli_whitelist_path):
+    """Load whitelist entries from the CLI path or default locations."""
+    candidate_paths = []
+    if cli_whitelist_path:
+        candidate_paths.append(cli_whitelist_path)
+    for default_path in DEFAULT_WHITELIST_PATHS:
+        if default_path not in candidate_paths:
+            candidate_paths.append(default_path)
+
+    for path in candidate_paths:
+        quiet_missing = path in DEFAULT_WHITELIST_PATHS and path != cli_whitelist_path
+        entries = load_list(path, quiet_missing=quiet_missing)
+        if os.path.exists(path):
+            log_message("Loaded whitelist from {}: {}".format(path, sorted(entries)))
+            return entries
+        if entries:
+            # File may exist temporarily or be virtual; still honour entries.
+            log_message("Loaded whitelist entries: {}".format(sorted(entries)))
+            return entries
+
+    if cli_whitelist_path:
+        log_message("Whitelist file {} not found. Proceeding without whitelist.".format(cli_whitelist_path))
+    else:
+        log_message("No whitelist file found in default locations. Proceeding without whitelist.")
+    return set()
+
+
+def handle_connection_attempt(node_id, connection_state, initial_node_id, timestamp):
+    """Handle repeated connect/disconnect behavior for a node."""
+    if is_whitelisted(node_id):
+        if connection_state.pop(node_id, None):
+            log_message("Node {} is whitelisted. Clearing connection tracking state.".format(node_id))
+        return False
+
+    node_state = connection_state.setdefault(node_id, {
+        'connection_attempts': 0,
+        'is_connected': False,
+        'banned': False,
+        'last_connected_at': None,
+        'last_disconnected_at': None,
+        'last_seen_at': None,
+    })
+
+    node_state['last_seen_at'] = timestamp
+
+    if node_state.get('banned'):
+        log_message("Node {} is already banned due to excessive reconnects.".format(node_id))
+        return True
+
+    if node_state.get('is_connected'):
+        return False
+
+    last_disconnected_at = node_state.get('last_disconnected_at')
+    if last_disconnected_at:
+        idle_seconds = timestamp - last_disconnected_at
+        if idle_seconds > CONNECTION_ATTEMPT_RESET_SECONDS and node_state.get('connection_attempts'):
+            log_message(
+                "Resetting connection attempt counter for node {} after {:.0f} seconds of inactivity.".format(
+                    node_id, idle_seconds
+                )
+            )
+            node_state['connection_attempts'] = 0
+
+    node_state['connection_attempts'] = node_state.get('connection_attempts', 0) + 1
+    node_state['is_connected'] = True
+    node_state['last_connected_at'] = timestamp
+    attempts = node_state['connection_attempts']
+    log_message("Node {} connection attempt count: {}".format(node_id, attempts))
+
+    if attempts >= CONNECTION_BAN_THRESHOLD:
+        reason = "Excessive connect/disconnect cycles detected. Node banned."
+        update_blocked_node(node_id, reason)
+        disconnect_node(node_id, initial_node_id, reason)
+        node_state['is_connected'] = False
+        node_state['banned'] = True
+        node_state['last_disconnected_at'] = timestamp
+        log_message("Node {} has been disconnected and banned after {} attempts.".format(node_id, attempts))
+        return True
+
+    if attempts >= CONNECTION_DISCONNECT_THRESHOLD:
+        reason = "Excessive connect/disconnect cycles detected. Node disconnected."
+        disconnect_node(node_id, initial_node_id, reason)
+        node_state['is_connected'] = False
+        node_state['last_disconnected_at'] = timestamp
+        log_message("Node {} disconnected after {} attempts.".format(node_id, attempts))
+        return True
+
+    return False
+
+
+def update_disconnection_status(current_links, connection_state, timestamp=None):
+    """Update the state for nodes that are no longer connected."""
+    current_link_set = {str(node) for node in current_links}
+    observed_at = timestamp if timestamp is not None else time.time()
+    for node_id, node_state in list(connection_state.items()):
+        if is_whitelisted(node_id):
+            if connection_state.pop(node_id, None) is not None:
+                log_message("Node {} is whitelisted. Removing it from connection tracking.".format(node_id))
+            continue
+
+        if node_id in current_link_set:
+            node_state['last_seen_at'] = observed_at
+            continue
+
+        if node_state.get('is_connected'):
+            node_state['is_connected'] = False
+            node_state['last_disconnected_at'] = observed_at
+            node_state['last_seen_at'] = observed_at
+            log_message("Node {} disconnected. Total connection attempts recorded: {}".format(
+                node_id, node_state.get('connection_attempts', 0)
+            ))
+
 
 def update_blocked_node(node_id, comment=""):
     """Update the Asterisk database to block the node."""
+    if is_whitelisted(node_id):
+        log_message("Node {} is whitelisted. Skipping block request.".format(node_id))
+        return
     try:
         sanitized_comment = comment.replace(" ", "_")
         command = "{} {} -rx \"database put {} {} {}\"".format(SUDO, ASTERISK, DB_FAMILY, node_id, sanitized_comment)
@@ -45,6 +219,9 @@ def update_blocked_node(node_id, comment=""):
 
 def disconnect_node(node_id, initial_node_id, reason=""):
     """Disconnect a node using Asterisk rpt command."""
+    if is_whitelisted(node_id):
+        log_message("Node {} is whitelisted. Skipping disconnect request.".format(node_id))
+        return
     try:
         command = "{} {} -rx \"rpt fun {} *1{}\"".format(SUDO, ASTERISK, initial_node_id, node_id)
         log_message("Disconnecting node {} from {}. Reason: {}".format(node_id, initial_node_id, reason))
@@ -95,10 +272,13 @@ def is_stats_enabled(node_id):
     log_message("Node {} is either not reporting stats or inactive.".format(node_id))
     return False
 
-def detect_crosslinking(node_id, links, whitelisted_nodes):
+def detect_crosslinking(node_id, links, whitelisted_nodes, initial_node_id):
     """Detect crosslinking for a given node based on its connections."""
-    log_message("Node {} checking links against whitelist: {}".format(node_id, whitelisted_nodes))
-    unexpected_nodes = [link for link in links if str(link) not in whitelisted_nodes]
+    allowed_nodes = {str(initial_node_id), str(node_id)} | {str(node) for node in whitelisted_nodes}
+    log_message(
+        "Node {} checking links against whitelist: {}".format(node_id, sorted(allowed_nodes))
+    )
+    unexpected_nodes = [link for link in links if str(link) not in allowed_nodes]
     log_message("Node {} connected links: {}".format(node_id, links))
     log_message("Node {} unexpected connections: {}".format(node_id, unexpected_nodes))
     if unexpected_nodes:
@@ -121,101 +301,146 @@ def main():
     parser.add_argument('--loop', type=int, help='Loop the script with the specified interval in seconds.')
     parser.add_argument('--area_restrictions', type=str, help='Path to the area restrictions file')
     parser.add_argument('--whitelist', type=str, help='Path to the whitelist file')
+    parser.add_argument('--run-once', action='store_true', help='Process a single iteration and exit.')
     args = parser.parse_args()
 
-    if args.loop and args.loop < 10:
-        print("Error: Loop interval must be at least 10 seconds.")
+    if args.run_once and args.loop is not None:
+        print("Error: --loop cannot be used with --run-once.")
         sys.exit(1)
 
+    if args.run_once:
+        loop_interval = None
+    else:
+        loop_interval = args.loop if args.loop is not None else 60
+        if loop_interval < 10:
+            print("Error: Loop interval must be at least 10 seconds.")
+            sys.exit(1)
+
     area_restrictions = load_list(args.area_restrictions) if args.area_restrictions else set()
-    whitelist = load_list(args.whitelist) if args.whitelist else set()
+    whitelist_entries = load_whitelist(args.whitelist)
+
+    global WHITELISTED_NODES
+    WHITELISTED_NODES = {str(node_id) for node_id in whitelist_entries}
 
     initial_url = STATS_URL + args.initial_node_id
+
+    connection_state = load_state()
+    for node_id in list(connection_state.keys()):
+        if is_whitelisted(node_id):
+            connection_state.pop(node_id, None)
+            log_message("Node {} is whitelisted at startup. Removed from tracked state.".format(node_id))
 
     while True:
         initial_data = fetch_data(initial_url)
 
-        if initial_data:
-            links = initial_data.get('stats', {}).get('data', {}).get('links', [])
-            log_message("Initial node {} connected links: {}".format(args.initial_node_id, links))
+        if not initial_data:
+            if loop_interval is None:
+                log_message("No valid data retrieved for the initial node. Exiting after single pass.")
+                save_state(connection_state)
+                break
 
-            for node_id in links:
-                log_message("Processing node ID: {}".format(node_id))
+            log_message("No valid data retrieved for the initial node. Waiting {} seconds before retrying.".format(loop_interval))
+            save_state(connection_state)
+            time.sleep(loop_interval)
+            continue
 
-                if str(node_id) in whitelist:
-                    log_message("Node {} is in the whitelist. It will remain connected.".format(node_id))
-                    continue
+        links = initial_data.get('stats', {}).get('data', {}).get('links', [])
+        observation_time = time.time()
+        log_message("Initial node {} connected links: {}".format(args.initial_node_id, links))
 
-                node_url = "https://stats.allstarlink.org/api/stats/" + str(node_id)
-                node_data = fetch_data(node_url)
+        update_disconnection_status(links, connection_state, observation_time)
 
-                if not node_data:
-                    log_message("No data available for node {}. Skipping to next node.".format(node_id))
-                    continue
+        for node_id in links:
+            log_message("Processing node ID: {}".format(node_id))
+            node_id_str = str(node_id)
 
-                # Check if stats field is None
-                stats = node_data.get("stats", None)
-                if stats is None:
-                    log_message("Node {} stats field is None. Treating as stats not enabled. Disconnecting and blocking.".format(node_id))
-                    reason = "Stat reporting disabled. Disconnecting and blocking node."
-                    update_blocked_node(node_id, reason)
-                    disconnect_node(node_id, args.initial_node_id, reason)
-                    log_message("Blocked and disconnected node {}. Stopping further processing.".format(node_id))
-                    return  # Stop further processing after blocking one node
+            if is_whitelisted(node_id_str):
+                log_message("Node {} is in the whitelist. It will remain connected.".format(node_id))
+                continue
 
-                # Check stats_enabled field
-                stats_enabled = node_data.get("stats_enabled", True)
-                log_message("Node {} stats_enabled value: {}".format(node_id, stats_enabled))
+            if handle_connection_attempt(node_id_str, connection_state, args.initial_node_id, observation_time):
+                save_state(connection_state)
+                continue
 
-                # Detect crosslinking
-                current_links = node_data.get('stats', {}).get('data', {}).get('links', [])
-                log_message("Node {} connected links: {}".format(node_id, current_links))
+            node_url = "https://stats.allstarlink.org/api/stats/" + str(node_id)
+            node_data = fetch_data(node_url)
 
-                # Explicitly check if the node is only connected to the initial node
-                if current_links == [args.initial_node_id]:
-                    log_message("Node {} is only connected to initial node {} and is not providing crosslink. It will remain connected.".format(node_id, args.initial_node_id))
-                    continue
+            if not node_data:
+                log_message("No data available for node {}. Skipping to next node.".format(node_id))
+                continue
 
-                crosslink_detected, unexpected_nodes = detect_crosslinking(node_id, current_links, whitelist)
+            # Check if stats field is None
+            stats = node_data.get("stats", None)
+            if stats is None:
+                log_message("Node {} stats field is None. Treating as stats not enabled. Disconnecting and blocking.".format(node_id))
+                reason = "Stat reporting disabled. Disconnecting and blocking node."
+                update_blocked_node(node_id, reason)
+                disconnect_node(node_id, args.initial_node_id, reason)
+                connection_state.pop(node_id_str, None)
+                log_message("Blocked and disconnected node {}. Continuing to next node.".format(node_id))
+                save_state(connection_state)
+                continue
 
-                if crosslink_detected:
-                    log_message("Crosslink detected on node {} with unexpected nodes: {}".format(node_id, unexpected_nodes))
-                    reason = "Crosslinking detected with unexpected nodes: {}".format(unexpected_nodes)
-                    update_blocked_node(node_id, reason)
-                    disconnect_node(node_id, args.initial_node_id, reason)
-                    log_message("Disconnected and blocked node {} due to crosslinking.".format(node_id))
-                    return  # Exit after handling a crosslink
+            # Check stats_enabled field
+            stats_enabled = node_data.get("stats_enabled", True)
+            log_message("Node {} stats_enabled value: {}".format(node_id, stats_enabled))
 
-                if stats_enabled is True:
-                    log_message("Node {} has stats explicitly enabled. It will remain connected.".format(node_id))
-                    continue
+            # Detect crosslinking
+            current_links = node_data.get('stats', {}).get('data', {}).get('links', [])
+            log_message("Node {} connected links: {}".format(node_id, current_links))
 
-                # Treat stats_enabled=None as disabled if stats is missing
-                if stats_enabled is None:
-                    log_message("Node {} stats_enabled is None. Treating as stats not enabled. Disconnecting and blocking.".format(node_id))
-                    reason = "Stat reporting disabled or missing. Disconnecting and blocking node."
-                    update_blocked_node(node_id, reason)
-                    disconnect_node(node_id, args.initial_node_id, reason)
-                    log_message("Blocked and disconnected node {}. Stopping further processing.".format(node_id))
-                    return  # Stop further processing after blocking one node
+            # Explicitly check if the node is only connected to the initial node
+            if current_links == [args.initial_node_id]:
+                log_message("Node {} is only connected to initial node {} and is not providing crosslink. It will remain connected.".format(node_id, args.initial_node_id))
+                continue
 
-                # Block and disconnect nodes explicitly reporting stats_enabled: False
-                if stats_enabled is False:
-                    log_message("Node {} stats_enabled is explicitly False. Disconnecting and blocking.".format(node_id))
-                    reason = "Stat reporting disabled. Disconnecting and blocking node."
-                    update_blocked_node(node_id, reason)
-                    disconnect_node(node_id, args.initial_node_id, reason)
-                    log_message("Blocked and disconnected node {}. Stopping further processing.".format(node_id))
-                    return  # Stop further processing after blocking one node
+            crosslink_detected, unexpected_nodes = detect_crosslinking(
+                node_id, current_links, WHITELISTED_NODES, args.initial_node_id
+            )
 
-        else:
-            log_message("No valid data retrieved for the initial node. Exiting.")
+            if crosslink_detected:
+                log_message("Crosslink detected on node {} with unexpected nodes: {}".format(node_id, unexpected_nodes))
+                reason = "Crosslinking detected with unexpected nodes: {}".format(unexpected_nodes)
+                update_blocked_node(node_id, reason)
+                disconnect_node(node_id, args.initial_node_id, reason)
+                connection_state.pop(node_id_str, None)
+                log_message("Disconnected and blocked node {} due to crosslinking. Continuing to next node.".format(node_id))
+                save_state(connection_state)
+                continue
+
+            if stats_enabled is True:
+                log_message("Node {} has stats explicitly enabled. It will remain connected.".format(node_id))
+                continue
+
+            # Treat stats_enabled=None as disabled if stats is missing
+            if stats_enabled is None:
+                log_message("Node {} stats_enabled is None. Treating as stats not enabled. Disconnecting and blocking.".format(node_id))
+                reason = "Stat reporting disabled or missing. Disconnecting and blocking node."
+                update_blocked_node(node_id, reason)
+                disconnect_node(node_id, args.initial_node_id, reason)
+                connection_state.pop(node_id_str, None)
+                log_message("Blocked and disconnected node {}. Continuing to next node.".format(node_id))
+                save_state(connection_state)
+                continue
+
+            # Block and disconnect nodes explicitly reporting stats_enabled: False
+            if stats_enabled is False:
+                log_message("Node {} stats_enabled is explicitly False. Disconnecting and blocking.".format(node_id))
+                reason = "Stat reporting disabled. Disconnecting and blocking node."
+                update_blocked_node(node_id, reason)
+                disconnect_node(node_id, args.initial_node_id, reason)
+                connection_state.pop(node_id_str, None)
+                log_message("Blocked and disconnected node {}. Continuing to next node.".format(node_id))
+                save_state(connection_state)
+                continue
+
+        update_disconnection_status(links, connection_state, time.time())
+        save_state(connection_state)
+
+        if loop_interval is None:
             break
 
-        if args.loop:
-            time.sleep(args.loop)
-        else:
-            break
+        time.sleep(loop_interval)
 
 if __name__ == "__main__":
     main()
