@@ -358,9 +358,9 @@ def main():
                     update_blocked_node(node_id, reason)
                     disconnect_node(node_id, args.initial_node_id, reason)
                     connection_state.pop(node_id_str, None)
-                    log_message("Blocked and disconnected node {}. Stopping further processing.".format(node_id))
+                    log_message("Blocked and disconnected node {}. Continuing to next node.".format(node_id))
                     save_state(connection_state)
-                    return  # Stop further processing after blocking one node
+                    continue
 
                 # Check stats_enabled field
                 stats_enabled = node_data.get("stats_enabled", True)
@@ -385,9 +385,9 @@ def main():
                     update_blocked_node(node_id, reason)
                     disconnect_node(node_id, args.initial_node_id, reason)
                     connection_state.pop(node_id_str, None)
-                    log_message("Disconnected and blocked node {} due to crosslinking.".format(node_id))
+                    log_message("Disconnected and blocked node {} due to crosslinking. Continuing to next node.".format(node_id))
                     save_state(connection_state)
-                    return  # Exit after handling a crosslink
+                    continue
 
                 if stats_enabled is True:
                     log_message("Node {} has stats explicitly enabled. It will remain connected.".format(node_id))
@@ -400,9 +400,9 @@ def main():
                     update_blocked_node(node_id, reason)
                     disconnect_node(node_id, args.initial_node_id, reason)
                     connection_state.pop(node_id_str, None)
-                    log_message("Blocked and disconnected node {}. Stopping further processing.".format(node_id))
+                    log_message("Blocked and disconnected node {}. Continuing to next node.".format(node_id))
                     save_state(connection_state)
-                    return  # Stop further processing after blocking one node
+                    continue
 
                 # Block and disconnect nodes explicitly reporting stats_enabled: False
                 if stats_enabled is False:
@@ -411,9 +411,9 @@ def main():
                     update_blocked_node(node_id, reason)
                     disconnect_node(node_id, args.initial_node_id, reason)
                     connection_state.pop(node_id_str, None)
-                    log_message("Blocked and disconnected node {}. Stopping further processing.".format(node_id))
+                    log_message("Blocked and disconnected node {}. Continuing to next node.".format(node_id))
                     save_state(connection_state)
-                    return  # Stop further processing after blocking one node
+                    continue
 
         else:
             log_message("No valid data retrieved for the initial node. Exiting.")
