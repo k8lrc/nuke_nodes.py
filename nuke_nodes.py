@@ -136,8 +136,16 @@ def handle_connection_attempt(node_id, connection_state, initial_node_id, timest
     node_state['last_seen_at'] = timestamp
 
     if node_state.get('banned'):
-        log_message("Node {} is already banned due to excessive reconnects.".format(node_id))
-        return True
+        if not is_node_blocked(node_id):
+            log_message(
+                "Node {} was previously banned but is no longer blocked. Clearing ban state.".format(node_id)
+            )
+            node_state['banned'] = False
+            node_state['connection_attempts'] = 0
+            node_state['last_disconnected_at'] = None
+        else:
+            log_message("Node {} is already banned due to excessive reconnects.".format(node_id))
+            return True
 
     if node_state.get('is_connected'):
         return False
@@ -216,6 +224,35 @@ def update_blocked_node(node_id, comment=""):
         log_message("Blocked node {} with comment: {}".format(node_id, sanitized_comment))
     except subprocess.CalledProcessError as e:
         log_message("Failed to block node {}: {}".format(node_id, e))
+
+
+def is_node_blocked(node_id):
+    """Check if the node is currently blocked in the Asterisk database."""
+    if is_whitelisted(node_id):
+        return False
+    command = "{} {} -rx \"database get {} {}\"".format(SUDO, ASTERISK, DB_FAMILY, node_id)
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except Exception as error:
+        log_message("Failed to check block status for node {}: {}".format(node_id, error))
+        return True
+
+    output = (result.stdout or "") + (result.stderr or "")
+    if "Database entry not found" in output:
+        return False
+    if "Value:" in output:
+        return True
+
+    log_message("Unexpected block status response for node {}: {}".format(node_id, output.strip()))
+    return False
+
 
 def disconnect_node(node_id, initial_node_id, reason=""):
     """Disconnect a node using Asterisk rpt command."""
