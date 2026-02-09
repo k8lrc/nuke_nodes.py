@@ -13,6 +13,8 @@ import random
 # Set up logging
 LOG_FILE = '/var/log/asterisk/nuke_nodes.log'
 logging.basicConfig(filename=LOG_FILE, level=logging.DEBUG, format='%(asctime)s - %(message)s')
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("requests").setLevel(logging.WARNING)
 
 STATE_FILE = '/var/log/asterisk/nuke_nodes_state.json'
 
@@ -313,7 +315,6 @@ def fetch_data(url, max_retries=10, backoff_factor=2, compact_not_found=False):
         try:
             response = requests.get(url)
             if response.status_code == 200:
-                log_message("Successfully fetched data from URL: {}".format(url))
                 return response.json()
             elif response.status_code == 429:
                 retry_after = response.headers.get("Retry-After")
@@ -425,6 +426,7 @@ def main():
 
     connection_state = load_state()
     last_node_fetch_time = 0.0
+    last_initial_links_signature = None
     for node_id in list(connection_state.keys()):
         if is_whitelisted(node_id):
             connection_state.pop(node_id, None)
@@ -447,7 +449,10 @@ def main():
 
             links = initial_data.get('stats', {}).get('data', {}).get('links', [])
             observation_time = time.time()
-            log_message("Initial node {} connected links: {}".format(args.initial_node_id, links))
+            links_signature = tuple(sorted(str(link) for link in links))
+            if links_signature != last_initial_links_signature:
+                log_message("Initial node {} connected links: {}".format(args.initial_node_id, links))
+                last_initial_links_signature = links_signature
 
             update_disconnection_status(links, connection_state, observation_time)
 
@@ -455,7 +460,8 @@ def main():
                 node_id_str = str(node_id)
 
                 if is_whitelisted(node_id_str):
-                    log_message("Node {} is in the whitelist. It will remain connected.".format(node_id))
+                    if set_node_event(connection_state, node_id_str, 'whitelisted'):
+                        log_message("Node {} is in the whitelist. It will remain connected.".format(node_id))
                     continue
 
                 if handle_connection_attempt(node_id_str, connection_state, args.initial_node_id, observation_time):
@@ -497,7 +503,8 @@ def main():
 
                 # Explicitly check if the node is only connected to the initial node
                 if current_links == [args.initial_node_id]:
-                    log_message("Node {} is only connected to initial node {} and is not providing crosslink. It will remain connected.".format(node_id, args.initial_node_id))
+                    if set_node_event(connection_state, node_id_str, 'connected_to_initial_only'):
+                        log_message("Node {} is only connected to initial node {} and is not providing crosslink. It will remain connected.".format(node_id, args.initial_node_id))
                     continue
 
                 crosslink_detected, unexpected_nodes = detect_crosslinking(
