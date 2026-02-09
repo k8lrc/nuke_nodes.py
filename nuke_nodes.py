@@ -131,6 +131,15 @@ def normalize_loop_interval(requested_interval):
     return requested_interval
 
 
+
+def set_node_event(connection_state, node_id, event_name):
+    """Record node event state and return True when the event changed."""
+    node_key = str(node_id)
+    node_state = connection_state.setdefault(node_key, {})
+    previous_event = node_state.get('last_logged_event')
+    node_state['last_logged_event'] = event_name
+    return previous_event != event_name
+
 def pace_api_request(last_request_time, min_delay_seconds, jitter_seconds):
     """Sleep as needed so node-level stats requests are spread out over time."""
     now = time.time()
@@ -157,6 +166,7 @@ def handle_connection_attempt(node_id, connection_state, initial_node_id, timest
         'last_connected_at': None,
         'last_disconnected_at': None,
         'last_seen_at': None,
+        'last_logged_event': None,
     })
 
     node_state['last_seen_at'] = timestamp
@@ -170,7 +180,8 @@ def handle_connection_attempt(node_id, connection_state, initial_node_id, timest
             node_state['connection_attempts'] = 0
             node_state['last_disconnected_at'] = None
         else:
-            log_message("Node {} is already banned due to excessive reconnects.".format(node_id))
+            if set_node_event(connection_state, node_id, 'already_banned'):
+                log_message("Node {} is already banned due to excessive reconnects.".format(node_id))
             return True
 
     if node_state.get('is_connected'):
@@ -191,7 +202,8 @@ def handle_connection_attempt(node_id, connection_state, initial_node_id, timest
     node_state['is_connected'] = True
     node_state['last_connected_at'] = timestamp
     attempts = node_state['connection_attempts']
-    log_message("Node {} connected. Tracking reconnect behavior for this session.".format(node_id))
+    if set_node_event(connection_state, node_id, 'connected'):
+        log_message("Node {} connected. Tracking reconnect behavior for this session.".format(node_id))
     log_message("Node {} connection attempt count: {}".format(node_id, attempts))
 
     if attempts >= CONNECTION_BAN_THRESHOLD:
@@ -313,10 +325,6 @@ def fetch_data(url, max_retries=10, backoff_factor=2, compact_not_found=False):
                 time.sleep(wait_time)
                 retries += 1
             elif response.status_code == 404 and compact_not_found:
-                node_id = url.rsplit('/', 1)[-1]
-                log_message(
-                    "Node {} not found on stats API (likely private/unlisted). Skipping node.".format(node_id)
-                )
                 return None
             else:
                 log_message("Failed to fetch data. Status code: {}. URL: {}. Response headers: {}".format(
@@ -463,8 +471,11 @@ def main():
                 node_data = fetch_data(node_url, compact_not_found=True)
 
                 if not node_data:
-                    log_message("No data available for node {}. Skipping to next node.".format(node_id))
+                    if set_node_event(connection_state, node_id_str, 'no_data'):
+                        log_message("No data available for node {}. Skipping to next node.".format(node_id))
                     continue
+
+                set_node_event(connection_state, node_id_str, 'data_available')
 
                 # Check if stats field is None
                 stats = node_data.get("stats", None)
