@@ -278,8 +278,8 @@ def disconnect_node(node_id, initial_node_id, reason=""):
     except subprocess.CalledProcessError as e:
         log_message("Failed to disconnect node {} from {}: {}".format(node_id, initial_node_id, e))
 
-def fetch_data(url, max_retries=10, backoff_factor=2):
-    """Fetches data from the given URL with retry logic for handling rate limiting."""
+def fetch_data(url, max_retries=10, backoff_factor=2, compact_not_found=False):
+    """Fetch data from URL with retries for rate limiting and optional compact 404 logging."""
     retries = 0
     while retries < max_retries:
         try:
@@ -296,6 +296,12 @@ def fetch_data(url, max_retries=10, backoff_factor=2):
                 log_message("429 Too Many Requests. Retrying in {} seconds... (Retry-After: {})".format(wait_time, retry_after))
                 time.sleep(wait_time)
                 retries += 1
+            elif response.status_code == 404 and compact_not_found:
+                node_id = url.rsplit('/', 1)[-1]
+                log_message(
+                    "Node {} not found on stats API (likely private/unlisted). Skipping node.".format(node_id)
+                )
+                return None
             else:
                 log_message("Failed to fetch data. Status code: {}. URL: {}. Response headers: {}".format(
                     response.status_code, url, response.headers
@@ -409,7 +415,7 @@ def main():
                     continue
 
                 node_url = "https://stats.allstarlink.org/api/stats/" + str(node_id)
-                node_data = fetch_data(node_url)
+                node_data = fetch_data(node_url, compact_not_found=True)
 
                 if not node_data:
                     log_message("No data available for node {}. Skipping to next node.".format(node_id))
