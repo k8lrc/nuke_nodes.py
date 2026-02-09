@@ -191,6 +191,7 @@ def handle_connection_attempt(node_id, connection_state, initial_node_id, timest
     node_state['is_connected'] = True
     node_state['last_connected_at'] = timestamp
     attempts = node_state['connection_attempts']
+    log_message("Node {} connected. Tracking reconnect behavior for this session.".format(node_id))
     log_message("Node {} connection attempt count: {}".format(node_id, attempts))
 
     if attempts >= CONNECTION_BAN_THRESHOLD:
@@ -443,7 +444,6 @@ def main():
             update_disconnection_status(links, connection_state, observation_time)
 
             for node_id in links:
-                log_message("Processing node ID: {}".format(node_id))
                 node_id_str = str(node_id)
 
                 if is_whitelisted(node_id_str):
