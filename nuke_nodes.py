@@ -8,6 +8,7 @@ import sys
 import os
 import logging
 import json
+import random
 
 # Set up logging
 LOG_FILE = '/var/log/asterisk/nuke_nodes.log'
@@ -27,6 +28,8 @@ DEFAULT_WHITELIST_PATHS = [
 CONNECTION_DISCONNECT_THRESHOLD = 5
 CONNECTION_BAN_THRESHOLD = 6
 CONNECTION_ATTEMPT_RESET_SECONDS = 900  # Reset attempt counter after 15 minutes of inactivity
+DEFAULT_NODE_FETCH_DELAY_SECONDS = 0.40
+DEFAULT_NODE_FETCH_JITTER_SECONDS = 0.20
 
 def log_message(message):
     """Logs a message to the log file and console."""
@@ -126,6 +129,18 @@ def normalize_loop_interval(requested_interval):
         )
         return 10
     return requested_interval
+
+
+def pace_api_request(last_request_time, min_delay_seconds, jitter_seconds):
+    """Sleep as needed so node-level stats requests are spread out over time."""
+    now = time.time()
+    elapsed = now - last_request_time
+    jitter = random.uniform(0, max(0.0, jitter_seconds))
+    wait_for = max(0.0, min_delay_seconds + jitter - elapsed)
+    if wait_for > 0:
+        time.sleep(wait_for)
+        now = time.time()
+    return now
 
 
 def handle_connection_attempt(node_id, connection_state, initial_node_id, timestamp):
@@ -356,10 +371,34 @@ def main():
     parser.add_argument('--area_restrictions', type=str, help='Path to the area restrictions file')
     parser.add_argument('--whitelist', type=str, help='Path to the whitelist file')
     parser.add_argument('--run-once', action='store_true', help='Process a single iteration and exit.')
+    parser.add_argument(
+        '--node-fetch-delay',
+        type=float,
+        default=DEFAULT_NODE_FETCH_DELAY_SECONDS,
+        help='Minimum seconds between per-node stats API calls (default: {}).'.format(
+            DEFAULT_NODE_FETCH_DELAY_SECONDS
+        ),
+    )
+    parser.add_argument(
+        '--node-fetch-jitter',
+        type=float,
+        default=DEFAULT_NODE_FETCH_JITTER_SECONDS,
+        help='Additional random delay added to per-node API pacing (default: {}).'.format(
+            DEFAULT_NODE_FETCH_JITTER_SECONDS
+        ),
+    )
     args = parser.parse_args()
 
     if args.run_once and args.loop is not None:
         print("Error: --loop cannot be used with --run-once.")
+        sys.exit(1)
+
+    if args.node_fetch_delay < 0:
+        print("Error: --node-fetch-delay must be >= 0.")
+        sys.exit(1)
+
+    if args.node_fetch_jitter < 0:
+        print("Error: --node-fetch-jitter must be >= 0.")
         sys.exit(1)
 
     if args.run_once:
@@ -376,6 +415,7 @@ def main():
     initial_url = STATS_URL + args.initial_node_id
 
     connection_state = load_state()
+    last_node_fetch_time = 0.0
     for node_id in list(connection_state.keys()):
         if is_whitelisted(node_id):
             connection_state.pop(node_id, None)
@@ -415,6 +455,11 @@ def main():
                     continue
 
                 node_url = "https://stats.allstarlink.org/api/stats/" + str(node_id)
+                last_node_fetch_time = pace_api_request(
+                    last_node_fetch_time,
+                    args.node_fetch_delay,
+                    args.node_fetch_jitter,
+                )
                 node_data = fetch_data(node_url, compact_not_found=True)
 
                 if not node_data:
