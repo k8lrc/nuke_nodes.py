@@ -491,11 +491,9 @@ def main():
 
                 # Check stats_enabled field
                 stats_enabled = node_data.get("stats_enabled", True)
-                log_message("Node {} stats_enabled value: {}".format(node_id, stats_enabled))
 
                 # Detect crosslinking
                 current_links = node_data.get('stats', {}).get('data', {}).get('links', [])
-                log_message("Node {} connected links: {}".format(node_id, current_links))
 
                 # Explicitly check if the node is only connected to the initial node
                 if current_links == [args.initial_node_id]:
@@ -518,7 +516,8 @@ def main():
                     continue
 
                 if stats_enabled is True:
-                    log_message("Node {} has stats explicitly enabled. It will remain connected.".format(node_id))
+                    if set_node_event(connection_state, node_id_str, 'stats_enabled_true'):
+                        log_message("Node {} has stats explicitly enabled. It will remain connected.".format(node_id))
                     continue
 
                 # Treat stats_enabled=None as disabled if stats is missing
